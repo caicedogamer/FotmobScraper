@@ -61,3 +61,60 @@ CREATE TABLE IF NOT EXISTS matches (
 
 CREATE INDEX IF NOT EXISTS idx_matches_player      ON matches(player_id);
 CREATE INDEX IF NOT EXISTS idx_matches_player_date ON matches(player_id, match_date DESC);
+
+CREATE TABLE IF NOT EXISTS imported_matches (
+    id               SERIAL      PRIMARY KEY,
+    source           TEXT        NOT NULL,
+    source_match_id  TEXT        NOT NULL,
+    match_url        TEXT,
+    match_date       TEXT,
+    league           TEXT,
+    home_team        TEXT,
+    away_team        TEXT,
+    home_id          TEXT,
+    away_id          TEXT,
+    score            TEXT,
+    home_formation   TEXT,
+    away_formation   TEXT,
+    fetched_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (source, source_match_id)
+);
+
+CREATE TABLE IF NOT EXISTS imported_match_players (
+    id                SERIAL  PRIMARY KEY,
+    imported_match_id INTEGER NOT NULL REFERENCES imported_matches(id) ON DELETE CASCADE,
+    side              TEXT,
+    player_id         TEXT,
+    name              TEXT,
+    shirt             TEXT,
+    starter           BOOLEAN,
+    rating            TEXT,
+    x_norm            NUMERIC,
+    y_norm            NUMERIC,
+    goals             INTEGER,
+    assists           INTEGER,
+    yellow            BOOLEAN,
+    red               BOOLEAN,
+    motm              BOOLEAN,
+    subbed_on         TEXT,
+    subbed_off        TEXT
+);
+
+CREATE TABLE IF NOT EXISTS imported_match_events (
+    id                SERIAL  PRIMARY KEY,
+    imported_match_id INTEGER NOT NULL REFERENCES imported_matches(id) ON DELETE CASCADE,
+    event_type        TEXT,
+    minute            INTEGER,
+    player            TEXT,
+    team              TEXT,
+    detail            TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_imported_matches_source
+    ON imported_matches(source, source_match_id);
+CREATE INDEX IF NOT EXISTS idx_imported_matches_date
+    ON imported_matches(match_date);
+CREATE INDEX IF NOT EXISTS idx_imp_match_players_match
+    ON imported_match_players(imported_match_id);
+CREATE INDEX IF NOT EXISTS idx_imp_match_events_match
+    ON imported_match_events(imported_match_id);

@@ -9,19 +9,29 @@ Usage:
 """
 
 import json
+import logging
+import os
 import queue
 import sys
 import threading
 from flask import Flask, render_template_string, request, jsonify, Response, stream_with_context
-from scraper import make_session, fetch_player_json, parse_player, search_players
-from db import upsert_player, load_player, list_players
+from fotmob.scraper import make_session, fetch_player_json, parse_player, search_players
+from fotmob.db import (
+    init_db, upsert_player, load_player, list_players,
+    upsert_imported_match, list_imported_matches,
+)
 from bulk import bulk_scrape
-from predictor import get_predictions, LEAGUES
+from bulk_matches import bulk_import_matches, MatchImportResult
+from fotmob.providers import PROVIDERS, is_enabled
+from fotmob.fetch_backend import VALID_ENGINES, scrapling_available
+from fotmob.predictor import get_predictions, LEAGUES
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 app = Flask(__name__)
+logger = logging.getLogger(__name__)
+init_db()
 
 TEMPLATE = """
 <!DOCTYPE html>
@@ -273,8 +283,10 @@ TEMPLATE = """
   <!-- Sidebar: saved players -->
   <nav class="sidebar">
     <h2>Saved Players</h2>
-    <a href="/predictions" style="color:#a78bfa;margin-bottom:.3rem;">⚡ Predictions</a>
-    <a href="/bulk" style="color:#3b82f6;margin-bottom:.5rem;">+ Bulk Import</a>
+    <a href="/predictions" style="color:#a78bfa;margin-bottom:.1rem;">⚡ Predictions</a>
+    <a href="/matches/imported" style="color:#fb923c;margin-bottom:.1rem;">📋 Matches</a>
+    <a href="/bulk" style="color:#3b82f6;margin-bottom:.1rem;">+ Bulk Players</a>
+    <a href="/matches/bulk" style="color:#34d399;margin-bottom:.5rem;">+ Bulk Matches</a>
     {% if saved_players %}
       {% for p in saved_players %}
       <a href="/?player_id={{ p.id }}&slug={{ p.slug }}"
@@ -476,19 +488,26 @@ TEMPLATE = """
   async function fetchResults(q) {
     const resp = await fetch('/search?q=' + encodeURIComponent(q));
     const data = await resp.json();
-    if (!data.length) { results.classList.remove('open'); results.innerHTML = ''; return; }
-    results.innerHTML = data.map(p =>
-      `<div class="search-result-item" data-id="${p.id}" data-slug="${p.slug}">
-        <span>${p.name}</span>
-        <span class="result-team">${p.team}</span>
-      </div>`
-    ).join('');
-    results.classList.add('open');
-    results.querySelectorAll('.search-result-item').forEach(el => {
-      el.addEventListener('click', () => {
-        window.location = '/?player_id=' + el.dataset.id + '&slug=' + el.dataset.slug;
+    results.innerHTML = '';
+    if (!data.length) { results.classList.remove('open'); return; }
+    for (const p of data) {
+      const item = document.createElement('div');
+      item.className = 'search-result-item';
+      item.dataset.id = p.id;
+      item.dataset.slug = p.slug;
+      const nameSpan = document.createElement('span');
+      nameSpan.textContent = p.name;
+      const teamSpan = document.createElement('span');
+      teamSpan.className = 'result-team';
+      teamSpan.textContent = p.team;
+      item.appendChild(nameSpan);
+      item.appendChild(teamSpan);
+      item.addEventListener('click', () => {
+        window.location = '/?player_id=' + encodeURIComponent(p.id) + '&slug=' + encodeURIComponent(p.slug);
       });
-    });
+      results.appendChild(item);
+    }
+    results.classList.add('open');
   }
 })();
 </script>
@@ -506,6 +525,7 @@ def search():
     try:
         return jsonify(search_players(q))
     except Exception:
+        logger.exception("Search failed for query %r", q)
         return jsonify([])
 
 
@@ -520,23 +540,30 @@ def index():
     from_cache = False
 
     if player_id and slug:
-        pid = int(player_id)
-        if not force_refresh:
-            cached = load_player(pid)
-            if cached:
-                player = cached
-                from_cache = True
-                cache_path = "fotmob.db"
+        try:
+            pid = int(player_id)
+        except ValueError:
+            error = "Invalid player ID."
+            pid = None
 
-        if player is None:
-            try:
-                session = make_session()
-                raw = fetch_player_json(session, pid, slug)
-                player = parse_player(raw)
-                upsert_player(player)
-                cache_path = "fotmob.db"
-            except Exception as exc:
-                error = str(exc)
+        if pid is not None:
+            if not force_refresh:
+                cached = load_player(pid)
+                if cached:
+                    player = cached
+                    from_cache = True
+                    cache_path = "fotmob.db"
+
+            if player is None:
+                try:
+                    session = make_session()
+                    raw = fetch_player_json(session, pid, slug)
+                    player = parse_player(raw)
+                    upsert_player(player)
+                    cache_path = "fotmob.db"
+                except Exception as exc:
+                    logger.exception("Error fetching player %s/%s", pid, slug)
+                    error = str(exc)
 
     return render_template_string(
         TEMPLATE, player=player, error=error, request=request,
@@ -633,6 +660,8 @@ BULK_TEMPLATE = """
   <nav class="sidebar">
     <h2>Saved Players</h2>
     <a href="/predictions" style="color:#a78bfa;">⚡ Predictions</a>
+    <a href="/matches/imported" style="color:#fb923c;">📋 Matches</a>
+    <a href="/matches/bulk" style="color:#34d399;">+ Bulk Matches</a>
     {% for p in saved_players %}
     <a href="/?player_id={{ p.id }}&slug={{ p.slug }}">{{ p.name or p.slug }}</a>
     <span class="sub">{{ p.club or '—' }}</span>
@@ -649,10 +678,17 @@ BULK_TEMPLATE = """
       <textarea id="names" placeholder="Erling Haaland&#10;Kylian Mbappe&#10;Bruno Fernandes"></textarea>
       <div class="controls">
         <label>Workers
-          <input type="number" id="workers" value="3" min="1" max="6">
+          <input type="number" id="workers" value="3" min="1" max="3">
         </label>
         <label>Delay (s)
           <input type="number" id="delay" value="1.0" min="0.5" max="5" step="0.5">
+        </label>
+        <label>Engine
+          <select id="engine">
+            <option value="requests">requests (default)</option>
+            <option value="auto">auto (Scrapling fallback)</option>
+            <option value="scrapling">scrapling</option>
+          </select>
         </label>
         <button type="submit">Import</button>
         <span id="status-text" style="font-size:.82rem;color:#6b7280;"></span>
@@ -683,6 +719,7 @@ document.getElementById('bulk-form').addEventListener('submit', async e => {
 
   const workers = document.getElementById('workers').value;
   const delay   = document.getElementById('delay').value;
+  const engine  = document.getElementById('engine').value;
   const btn     = document.querySelector('button[type="submit"]');
   const statusEl = document.getElementById('status-text');
   const progress = document.getElementById('progress');
@@ -701,7 +738,7 @@ document.getElementById('bulk-form').addEventListener('submit', async e => {
   const resp = await fetch('/bulk/stream', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({names, workers: +workers, delay: +delay}),
+    body: JSON.stringify({names, workers: +workers, delay: +delay, engine}),
   });
 
   const reader = resp.body.getReader();
@@ -724,15 +761,38 @@ document.getElementById('bulk-form').addEventListener('submit', async e => {
       else failed++;
 
       const tr = document.createElement('tr');
-      tr.innerHTML = ev.status === 'ok'
-        ? `<td>${ev.name}</td><td>${ev.club || '—'}</td>
-           <td><span class="badge-ok">✓ saved</span></td>
-           <td style="text-align:right">${ev.matches}</td>`
-        : `<td>${ev.query}</td><td>—</td>
-           <td><span class="${ev.status === 'not_found' ? 'badge-miss' : 'badge-err'}">
-             ${ev.status === 'not_found' ? '? not found' : '✗ error'}</span>
-             <span style="font-size:.75rem;color:#4b5563;margin-left:.4rem">${ev.error || ''}</span>
-           </td><td></td>`;
+      if (ev.status === 'ok') {
+        const tdName = document.createElement('td');
+        tdName.textContent = ev.name;
+        const tdClub = document.createElement('td');
+        tdClub.textContent = ev.club || '—';
+        const tdStatus = document.createElement('td');
+        const badge = document.createElement('span');
+        badge.className = 'badge-ok';
+        badge.textContent = '✓ saved';
+        tdStatus.appendChild(badge);
+        const tdMatches = document.createElement('td');
+        tdMatches.style.textAlign = 'right';
+        tdMatches.textContent = ev.matches;
+        tr.append(tdName, tdClub, tdStatus, tdMatches);
+      } else {
+        const tdName = document.createElement('td');
+        tdName.textContent = ev.query;
+        const tdClub = document.createElement('td');
+        tdClub.textContent = '—';
+        const tdStatus = document.createElement('td');
+        const badge = document.createElement('span');
+        badge.className = ev.status === 'not_found' ? 'badge-miss' : 'badge-err';
+        badge.textContent = ev.status === 'not_found' ? '? not found' : '✗ error';
+        tdStatus.appendChild(badge);
+        if (ev.error) {
+          const errSpan = document.createElement('span');
+          errSpan.style.cssText = 'font-size:.75rem;color:#4b5563;margin-left:.4rem';
+          errSpan.textContent = ev.error;
+          tdStatus.appendChild(errSpan);
+        }
+        tr.append(tdName, tdClub, tdStatus, document.createElement('td'));
+      }
       tbody.prepend(tr);
     }
   }
@@ -754,10 +814,30 @@ def bulk_page():
 
 @app.route("/bulk/stream", methods=["POST"])
 def bulk_stream():
-    body    = request.get_json()
-    names   = body.get("names", [])
-    workers = min(int(body.get("workers", 3)), 6)
-    delay   = max(float(body.get("delay", 1.0)), 0.5)
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "Invalid JSON body"}), 400
+
+    names_raw = body.get("names")
+    if not isinstance(names_raw, list):
+        return jsonify({"error": "'names' must be a list"}), 400
+    names = [n.strip() for n in names_raw if isinstance(n, str) and str(n).strip()]
+    if not names:
+        return jsonify({"error": "No valid names provided"}), 400
+
+    try:
+        workers = max(1, min(int(body.get("workers", 3)), 3))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'workers' must be an integer"}), 400
+
+    try:
+        delay = max(0.5, min(float(body.get("delay", 1.0)), 5.0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'delay' must be a number"}), 400
+
+    engine = str(body.get("engine", "requests")).strip()
+    if engine not in VALID_ENGINES:
+        return jsonify({"error": f"Invalid engine: {engine!r}. Valid: {sorted(VALID_ENGINES)}"}), 400
 
     result_queue = queue.Queue()
 
@@ -777,8 +857,13 @@ def bulk_stream():
             })
 
     def run():
-        bulk_scrape(names, workers=workers, delay=delay, progress_cb=on_result)
-        result_queue.put(None)  # sentinel
+        try:
+            bulk_scrape(names, workers=workers, delay=delay, progress_cb=on_result,
+                        engine=engine)
+        except Exception:
+            logger.exception("bulk_scrape raised unexpectedly")
+        finally:
+            result_queue.put(None)  # sentinel always sent
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -901,7 +986,9 @@ PREDICTIONS_TEMPLATE = """
     <h2>Navigation</h2>
     <a href="/">&#9917; Player Stats</a>
     <a href="/predictions" class="active" style="color:#c4b5fd;">⚡ Predictions</a>
-    <a href="/bulk" style="color:#3b82f6;">+ Bulk Import</a>
+    <a href="/matches/imported" style="color:#fb923c;">📋 Matches</a>
+    <a href="/bulk" style="color:#3b82f6;">+ Bulk Players</a>
+    <a href="/matches/bulk" style="color:#34d399;">+ Bulk Matches</a>
     {% if saved_players %}
     <h2 style="margin-top:1rem;">Saved Players</h2>
     {% for p in saved_players %}
@@ -914,19 +1001,31 @@ PREDICTIONS_TEMPLATE = """
   <div class="main">
     <h1>⚡ Match Predictor</h1>
     <p class="subtitle">
-      Poisson model seeded from each team's last 8 results.
-      First load per league takes ~15 s while team form is fetched; subsequent loads use cache.
+      ML model when trained; Poisson baseline otherwise.
     </p>
 
     <!-- League selector -->
     <div class="league-tabs">
       {% for key, info in leagues.items() %}
-      <a href="/predictions?league={{ key }}"
+      <a href="/predictions?league={{ key }}&model={{ selected_model }}"
          class="league-tab {{ 'active' if key == selected_league else '' }}">
         {{ info.flag }} {{ info.name }}
       </a>
       {% endfor %}
     </div>
+
+    <div class="league-tabs" style="margin-top:-1rem;">
+      {% for key, label in model_modes.items() %}
+      <a href="/predictions?league={{ selected_league }}&model={{ key }}"
+         class="league-tab {{ 'active' if key == selected_model else '' }}">
+        {{ label }}
+      </a>
+      {% endfor %}
+    </div>
+
+    {% if model_label and predictions %}
+    <p class="subtitle" style="margin-top:-.8rem;">Model: {{ model_label }}</p>
+    {% endif %}
 
     {% if error and not predictions %}
     <div class="alert">{{ error }}</div>
@@ -995,25 +1094,536 @@ PREDICTIONS_TEMPLATE = """
 @app.route("/predictions")
 def predictions_page():
     league_key = request.args.get("league", "").strip()
+    model_mode = request.args.get("model", "auto").strip()
+    if model_mode not in ("auto", "ml", "poisson"):
+        model_mode = "auto"
     predictions = []
     error = None
     selected_league = league_key or ""
+    model_label = None
 
     if league_key and league_key in LEAGUES:
-        result = get_predictions(league_key)
+        result = get_predictions(league_key, model=model_mode)
         predictions = result.get("predictions", [])
         error = result.get("error")
+        model_type = result.get("model_type")
+        meta = result.get("model_meta") or {}
+        if model_type:
+            model_label = str(model_type).replace("_", " ").title()
+            trained_on = meta.get("total_matches") or meta.get("train_matches")
+            if trained_on:
+                model_label += f" · trained on {trained_on:,} matches"
 
     return render_template_string(
         PREDICTIONS_TEMPLATE,
         leagues=LEAGUES,
         selected_league=selected_league,
+        selected_model=model_mode,
+        model_modes={
+            "auto": "Auto",
+            "ml": "ML",
+            "poisson": "Poisson",
+        },
+        model_label=model_label,
         predictions=predictions,
         error=error,
         saved_players=list_players(),
     )
 
 
+# ── Imported matches listing ──────────────────────────────────────────────────
+
+MATCHES_IMPORTED_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Imported Matches — FotMob</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0e1117; color: #e4e6eb; min-height: 100vh; display: flex;
+    }
+    .sidebar {
+      width: 220px; min-width: 220px; background: #13151f;
+      border-right: 1px solid #2e3340; padding: 1.5rem 0;
+      position: sticky; top: 0; height: 100vh; overflow-y: auto;
+    }
+    .sidebar h2 {
+      font-size: .72rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .08em; color: #4b5563;
+      padding: 0 1rem .6rem; border-bottom: 1px solid #2e3340; margin-bottom: .5rem;
+    }
+    .sidebar a {
+      display: block; padding: .5rem 1rem; font-size: .85rem;
+      color: #9ca3af; text-decoration: none;
+      border-left: 3px solid transparent; transition: all .12s;
+    }
+    .sidebar a:hover { background: #1a1d27; color: #e4e6eb; }
+    .sidebar a.active { border-left-color: #fb923c; color: #fdba74; background: #1a1d27; }
+    .sidebar .sub { font-size: .75rem; color: #4b5563; padding: .15rem 1rem; }
+    .main { flex: 1; padding: 2rem 1.5rem; overflow-x: auto; }
+    h1 { font-size: 1.4rem; font-weight: 700; color: #fff; margin-bottom: .4rem; }
+    .subtitle { font-size: .85rem; color: #6b7280; margin-bottom: 1.5rem; }
+    .card {
+      background: #1a1d27; border: 1px solid #2e3340; border-radius: 12px;
+      overflow: hidden; max-width: 1100px;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: .88rem; }
+    th {
+      padding: .5rem .9rem; text-align: left; font-size: .72rem; font-weight: 600;
+      text-transform: uppercase; letter-spacing: .07em; color: #6b7280;
+      border-bottom: 1px solid #2e3340; background: #161822;
+    }
+    td { padding: .5rem .9rem; border-bottom: 1px solid #1e2130; color: #d1d5db; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: #1e2130; }
+    .badge-source {
+      display: inline-block; padding: .1rem .5rem; border-radius: 999px;
+      font-size: .72rem; font-weight: 600; background: #1e3a5f; color: #93c5fd;
+    }
+    .score { font-weight: 700; color: #fff; }
+    .empty { padding: 2rem; text-align: center; color: #4b5563; font-size: .9rem; }
+    .action-link { color: #3b82f6; text-decoration: none; font-size: .8rem; }
+    .action-link:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+<div style="display:flex;width:100%;">
+  <nav class="sidebar">
+    <h2>Navigation</h2>
+    <a href="/">&#9917; Player Stats</a>
+    <a href="/predictions" style="color:#a78bfa;">⚡ Predictions</a>
+    <a href="/matches/imported" class="active">📋 Matches</a>
+    <a href="/bulk" style="color:#3b82f6;">+ Bulk Players</a>
+    <a href="/matches/bulk" style="color:#34d399;">+ Bulk Matches</a>
+    {% if saved_players %}
+    <h2 style="margin-top:1rem;">Saved Players</h2>
+    {% for p in saved_players %}
+    <a href="/?player_id={{ p.id }}&slug={{ p.slug }}">{{ p.name or p.slug }}</a>
+    <span class="sub">{{ p.club or '—' }}</span>
+    {% endfor %}
+    {% endif %}
+  </nav>
+
+  <div class="main">
+    <h1>📋 Imported Matches</h1>
+    <p class="subtitle">
+      {{ matches|length }} match{% if matches|length != 1 %}es{% endif %} stored
+      &nbsp;·&nbsp;
+      <a href="/matches/bulk" style="color:#34d399;text-decoration:none;">+ Import more</a>
+    </p>
+
+    <div class="card">
+      {% if matches %}
+      <table>
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>League</th>
+            <th>Home</th>
+            <th>Score</th>
+            <th>Away</th>
+            <th>Form.</th>
+            <th>Source</th>
+            <th>Fetched</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for m in matches %}
+          <tr>
+            <td>{{ m.match_date or '—' }}</td>
+            <td style="color:#6b7280;font-size:.82rem;">{{ m.league or '—' }}</td>
+            <td>{{ m.home_team or '—' }}</td>
+            <td><span class="score">{{ m.score or '—' }}</span></td>
+            <td>{{ m.away_team or '—' }}</td>
+            <td style="color:#6b7280;font-size:.78rem;">
+              {% if m.home_formation %}{{ m.home_formation }}{% endif %}
+              {% if m.home_formation and m.away_formation %} / {% endif %}
+              {% if m.away_formation %}{{ m.away_formation }}{% endif %}
+              {% if not m.home_formation and not m.away_formation %}—{% endif %}
+            </td>
+            <td><span class="badge-source">{{ m.source }}</span></td>
+            <td style="color:#4b5563;font-size:.78rem;">
+              {{ m.fetched_at|string|truncate(16, True, '') if m.fetched_at else '—' }}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <div class="empty">
+        No matches imported yet.
+        <a class="action-link" href="/matches/bulk">Import some →</a>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+
+@app.route("/matches/imported")
+def matches_imported():
+    matches = list_imported_matches()
+    return render_template_string(
+        MATCHES_IMPORTED_TEMPLATE,
+        matches=matches,
+        saved_players=list_players(),
+    )
+
+
+# ── Bulk match import page ────────────────────────────────────────────────────
+
+MATCH_BULK_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bulk Match Import — FotMob</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0e1117; color: #e4e6eb; min-height: 100vh; display: flex;
+    }
+    .sidebar {
+      width: 220px; min-width: 220px; background: #13151f;
+      border-right: 1px solid #2e3340; padding: 1.5rem 0;
+      position: sticky; top: 0; height: 100vh; overflow-y: auto;
+    }
+    .sidebar h2 {
+      font-size: .72rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .08em; color: #4b5563;
+      padding: 0 1rem .6rem; border-bottom: 1px solid #2e3340; margin-bottom: .5rem;
+    }
+    .sidebar a {
+      display: block; padding: .5rem 1rem; font-size: .85rem;
+      color: #9ca3af; text-decoration: none;
+      border-left: 3px solid transparent; transition: all .12s;
+    }
+    .sidebar a:hover { background: #1a1d27; color: #e4e6eb; }
+    .sidebar a.active { border-left-color: #34d399; color: #6ee7b7; background: #1a1d27; }
+    .sidebar .sub { font-size: .75rem; color: #4b5563; padding: .15rem 1rem; }
+    .main { flex: 1; padding: 2rem 2rem; max-width: 820px; }
+    h1 { font-size: 1.4rem; font-weight: 700; color: #fff; margin-bottom: .4rem; }
+    .subtitle { font-size: .85rem; color: #6b7280; margin-bottom: 1.8rem; }
+    textarea {
+      width: 100%; height: 180px;
+      background: #1a1d27; border: 1px solid #2e3340; border-radius: 10px;
+      color: #e4e6eb; font-size: .82rem; padding: .8rem 1rem;
+      resize: vertical; font-family: monospace;
+    }
+    textarea:focus { outline: 2px solid #34d399; border-color: transparent; }
+    .controls {
+      display: flex; gap: .8rem; align-items: center;
+      margin-top: .8rem; flex-wrap: wrap;
+    }
+    .controls label { font-size: .8rem; color: #6b7280; display: flex; align-items: center; gap: .4rem; }
+    .controls input[type="number"], .controls select {
+      padding: .35rem .5rem;
+      background: #1a1d27; border: 1px solid #2e3340; border-radius: 6px;
+      color: #e4e6eb; font-size: .85rem;
+    }
+    .controls input[type="number"] { width: 60px; }
+    .controls select { min-width: 160px; }
+    .controls select option:disabled { color: #4b5563; }
+    button[type="submit"] {
+      padding: .55rem 1.4rem; background: #059669; color: #fff;
+      border: none; border-radius: 8px; font-size: .95rem;
+      font-weight: 600; cursor: pointer; transition: background .15s;
+    }
+    button[type="submit"]:hover { background: #047857; }
+    button[type="submit"]:disabled { background: #1e3a2f; color: #4b5563; cursor: not-allowed; }
+    #progress { margin-top: 1.5rem; display: none; }
+    .progress-bar-wrap { height: 6px; background: #1e2130; border-radius: 999px; margin-bottom: 1rem; }
+    .progress-bar { height: 6px; background: #34d399; border-radius: 999px; width: 0%; transition: width .3s; }
+    table { width: 100%; border-collapse: collapse; font-size: .85rem; margin-top: .5rem; }
+    th {
+      padding: .45rem .8rem; text-align: left; font-size: .72rem; font-weight: 600;
+      text-transform: uppercase; letter-spacing: .07em; color: #6b7280;
+      border-bottom: 1px solid #2e3340; background: #161822;
+    }
+    td { padding: .45rem .8rem; border-bottom: 1px solid #1e2130; color: #d1d5db; }
+    tr:last-child td { border-bottom: none; }
+    .badge-ok   { color: #86efac; font-weight: 700; }
+    .badge-err  { color: #fca5a5; font-weight: 700; }
+    .badge-ns   { color: #fbbf24; font-weight: 700; }
+    #summary { margin-top: 1rem; font-size: .85rem; color: #6b7280; }
+  </style>
+</head>
+<body>
+<div style="display:flex;width:100%;">
+  <nav class="sidebar">
+    <h2>Navigation</h2>
+    <a href="/">&#9917; Player Stats</a>
+    <a href="/predictions" style="color:#a78bfa;">⚡ Predictions</a>
+    <a href="/matches/imported" style="color:#fb923c;">📋 Matches</a>
+    <a href="/bulk" style="color:#3b82f6;">+ Bulk Players</a>
+    <a href="/matches/bulk" class="active">+ Bulk Matches</a>
+    {% if saved_players %}
+    <h2 style="margin-top:1rem;">Saved Players</h2>
+    {% for p in saved_players %}
+    <a href="/?player_id={{ p.id }}&slug={{ p.slug }}">{{ p.name or p.slug }}</a>
+    <span class="sub">{{ p.club or '—' }}</span>
+    {% endfor %}
+    {% endif %}
+  </nav>
+
+  <div class="main">
+    <h1>+ Bulk Match Import</h1>
+    <p class="subtitle">One match URL per line. Use the provider that matches the URLs you paste.</p>
+
+    <form id="match-bulk-form">
+      <textarea id="urls" placeholder="https://www.fotmob.com/matches/man-city-vs-arsenal/...&#10;https://www.fotmob.com/matches/chelsea-vs-liverpool/..."></textarea>
+      <div class="controls">
+        <label>Provider
+          <select id="provider">
+            {% for key, label in providers.items() %}
+            <option value="{{ key }}"
+              {% if not enabled(key) %}disabled title="Not yet implemented"{% endif %}>
+              {{ label }}
+            </option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Workers
+          <input type="number" id="workers" value="2" min="1" max="3">
+        </label>
+        <label>Delay (s)
+          <input type="number" id="delay" value="1.0" min="0.5" max="5" step="0.5">
+        </label>
+        <label>Engine
+          <select id="engine">
+            <option value="requests">requests (default)</option>
+            <option value="auto">auto (Scrapling fallback)</option>
+            <option value="scrapling">scrapling</option>
+          </select>
+        </label>
+        <button type="submit">Import</button>
+        <span id="status-text" style="font-size:.82rem;color:#6b7280;"></span>
+      </div>
+    </form>
+
+    <div id="progress">
+      <div class="progress-bar-wrap"><div class="progress-bar" id="bar"></div></div>
+      <table>
+        <thead>
+          <tr>
+            <th>Match</th><th>Date</th><th>Score</th><th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="results-body"></tbody>
+      </table>
+      <div id="summary"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+document.getElementById('match-bulk-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const urls = document.getElementById('urls').value
+    .split('\\n').map(s => s.trim()).filter(Boolean);
+  if (!urls.length) return;
+
+  const provider  = document.getElementById('provider').value;
+  const workers   = document.getElementById('workers').value;
+  const delay     = document.getElementById('delay').value;
+  const engine    = document.getElementById('engine').value;
+  const btn       = document.querySelector('button[type="submit"]');
+  const statusEl  = document.getElementById('status-text');
+  const progress  = document.getElementById('progress');
+  const bar       = document.getElementById('bar');
+  const tbody     = document.getElementById('results-body');
+  const summary   = document.getElementById('summary');
+
+  btn.disabled = true;
+  progress.style.display = 'block';
+  tbody.innerHTML = '';
+  summary.textContent = '';
+  statusEl.textContent = `Importing ${urls.length} match(es)...`;
+
+  let done = 0, ok = 0, failed = 0, notSupported = 0;
+
+  const resp = await fetch('/matches/bulk/stream', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({urls, provider, workers: +workers, delay: +delay, engine}),
+  });
+
+  if (!resp.ok) {
+    statusEl.textContent = 'Request failed — check input.';
+    btn.disabled = false;
+    return;
+  }
+
+  const reader  = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+
+  while (true) {
+    const {value, done: streamDone} = await reader.read();
+    if (streamDone) break;
+    buf += decoder.decode(value, {stream: true});
+    const lines = buf.split('\\n');
+    buf = lines.pop();
+    for (const line of lines) {
+      if (!line.startsWith('data:')) continue;
+      let ev;
+      try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
+      done++;
+      bar.style.width = Math.round(done / urls.length * 100) + '%';
+
+      const tr = document.createElement('tr');
+      if (ev.status === 'ok') {
+        ok++;
+        const tdMatch = document.createElement('td');
+        tdMatch.textContent = (ev.home_team || '?') + ' vs ' + (ev.away_team || '?');
+        const tdDate = document.createElement('td');
+        tdDate.style.color = '#6b7280';
+        tdDate.textContent = ev.date || '—';
+        const tdScore = document.createElement('td');
+        tdScore.style.fontWeight = '700';
+        tdScore.textContent = ev.score || '—';
+        const tdStatus = document.createElement('td');
+        const badge = document.createElement('span');
+        badge.className = 'badge-ok';
+        badge.textContent = '✓ saved';
+        tdStatus.appendChild(badge);
+        tr.append(tdMatch, tdDate, tdScore, tdStatus);
+      } else {
+        if (ev.status === 'not_supported') notSupported++; else failed++;
+        const tdMatch = document.createElement('td');
+        const shortUrl = ev.url.length > 55 ? '…' + ev.url.slice(-52) : ev.url;
+        tdMatch.textContent = shortUrl;
+        tdMatch.colSpan = 3;
+        const tdStatus = document.createElement('td');
+        const badge = document.createElement('span');
+        badge.className = ev.status === 'not_supported' ? 'badge-ns' : 'badge-err';
+        badge.textContent = ev.status === 'not_supported' ? '? not supported' : '✗ error';
+        tdStatus.appendChild(badge);
+        if (ev.error) {
+          const errSpan = document.createElement('span');
+          errSpan.style.cssText = 'font-size:.72rem;color:#4b5563;margin-left:.4rem;';
+          errSpan.textContent = ev.error;
+          tdStatus.appendChild(errSpan);
+        }
+        tr.append(tdMatch, tdStatus);
+      }
+      tbody.prepend(tr);
+    }
+  }
+
+  statusEl.textContent = '';
+  summary.textContent =
+    `Done — ${ok} saved, ${notSupported} not supported, ${failed} errors.`;
+  btn.disabled = false;
+});
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/matches/bulk")
+def matches_bulk_page():
+    return render_template_string(
+        MATCH_BULK_TEMPLATE,
+        saved_players=list_players(),
+        providers=PROVIDERS,
+        enabled=is_enabled,
+    )
+
+
+@app.route("/matches/bulk/stream", methods=["POST"])
+def matches_bulk_stream():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "Invalid JSON body"}), 400
+
+    urls_raw = body.get("urls")
+    if not isinstance(urls_raw, list):
+        return jsonify({"error": "'urls' must be a list"}), 400
+    urls = [u.strip() for u in urls_raw if isinstance(u, str) and str(u).strip()]
+    if not urls:
+        return jsonify({"error": "No valid URLs provided"}), 400
+
+    provider = str(body.get("provider", "fotmob")).strip()
+    if provider not in PROVIDERS:
+        return jsonify({"error": f"Unknown provider: {provider!r}"}), 400
+    if not is_enabled(provider):
+        return jsonify({"error": f"Provider {provider!r} is not yet implemented"}), 400
+
+    try:
+        workers = max(1, min(int(body.get("workers", 2)), 3))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'workers' must be an integer"}), 400
+
+    try:
+        delay = max(0.5, min(float(body.get("delay", 1.0)), 5.0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'delay' must be a number"}), 400
+
+    match_engine = str(body.get("engine", "requests")).strip()
+    if match_engine not in VALID_ENGINES:
+        return jsonify({"error": f"Invalid engine: {match_engine!r}. Valid: {sorted(VALID_ENGINES)}"}), 400
+
+    result_queue: queue.Queue = queue.Queue()
+
+    def on_result(r: MatchImportResult):
+        if r.status == "ok":
+            result_queue.put({
+                "status":    "ok",
+                "url":       r.url,
+                "match_id":  r.match_id,
+                "home_team": r.home_team,
+                "away_team": r.away_team,
+                "score":     r.score,
+                "date":      r.date,
+            })
+        else:
+            result_queue.put({
+                "status": r.status,
+                "url":    r.url,
+                "error":  r.error,
+            })
+
+    def run():
+        try:
+            bulk_import_matches(
+                urls, provider=provider,
+                workers=workers, delay=delay,
+                progress_cb=on_result,
+                engine=match_engine,
+            )
+        except Exception:
+            logger.exception("bulk_import_matches raised unexpectedly")
+        finally:
+            result_queue.put(None)  # sentinel always sent
+
+    threading.Thread(target=run, daemon=True).start()
+
+    def generate():
+        while True:
+            item = result_queue.get()
+            if item is None:
+                break
+            yield f"data: {json.dumps(item)}\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
+
+
 if __name__ == "__main__":
     print("Starting FotMob player stats app at http://localhost:5000")
-    app.run(debug=True, port=5000, threaded=True)
+    debug = os.getenv("FLASK_DEBUG", "0") == "1"
+    app.run(debug=debug, port=5000, threaded=True)

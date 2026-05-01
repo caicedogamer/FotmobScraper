@@ -5,13 +5,18 @@ A Python web app + Discord bot that scrapes player stats from FotMob, displays t
 
 ## File layout
 ```
-app.py        Flask web app (entry point — python app.py, port 5000)
-bot.py        Discord bot (entry point — python bot.py)
-scraper.py    HTTP scraping + response parsing (no DB knowledge)
-db.py         PostgreSQL layer (upsert_player, load_player, list_players)
-bulk.py       Bulk concurrent scraper + CLI
-schema.sql    DDL — run step 1 against postgres DB, step 2 against fotmob DB
-.env          DB credentials + DISCORD_TOKEN (gitignored)
+app.py              Flask web app (entry point — python app.py, port 5000)
+bot.py              Discord bot (entry point — python bot.py)
+bulk.py             Bulk player scraper + CLI
+bulk_matches.py     Bulk match importer + CLI
+train_model.py      Offline ML model training CLI
+scraper.py          Compatibility wrapper for the player scraper CLI
+fotmob/scraper.py   HTTP scraping + response parsing (no DB knowledge)
+fotmob/db.py        PostgreSQL layer (upsert_player, load_player, list_players)
+fotmob/predictor.py Match predictor facade
+fotmob/providers/   Match provider implementations
+schema.sql          DDL — run step 1 against postgres DB, step 2 against fotmob DB
+.env                DB credentials + DISCORD_TOKEN (gitignored)
 .gitignore
 CLAUDE.md
 ```

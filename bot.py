@@ -27,19 +27,21 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from db import list_players, load_player
-from scraper import (
+from fotmob.db import init_db, list_players, load_player, upsert_player
+from fotmob.scraper import (
     search_players, make_session,
     fetch_player_json, parse_player,
     fetch_match_json, parse_match,
 )
-from pitch import draw_lineup_image
-from predictor import get_predictions, LEAGUES
+from fotmob.pitch import draw_lineup_image
+from fotmob.predictor import get_predictions, LEAGUES
 
 load_dotenv(Path(__file__).parent / ".env")
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+init_db()
 
 FOTMOB_BASE = "https://www.fotmob.com"
 
@@ -235,7 +237,9 @@ async def _resolve_player(name: str) -> dict | None:
     def _scrape():
         session = make_session()
         raw = fetch_player_json(session, top["id"], top["slug"])
-        return parse_player(raw)
+        player = parse_player(raw)
+        upsert_player(player)
+        return player
 
     return await loop.run_in_executor(None, _scrape)
 
@@ -664,8 +668,20 @@ async def cmd_match(interaction: discord.Interaction, name: str, number: int = 1
 
 _OUTCOME_EMOJI = {"Home Win": "🏠", "Draw": "🟡", "Away Win": "✈️"}
 
+
+def _pretty_match_date(date_str: str) -> str:
+    try:
+        from datetime import datetime
+        return datetime.strptime(date_str, "%Y-%m-%d").strftime("%b %d")
+    except (TypeError, ValueError):
+        return date_str or "TBD"
+
+
 @tree.command(name="predict", description="Predicted scores for upcoming matches in a league")
-@app_commands.describe(league="Which league to predict")
+@app_commands.describe(
+    league="Which league to predict",
+    model="Prediction model: auto uses ML when trained, otherwise Poisson",
+)
 @app_commands.choices(league=[
     app_commands.Choice(name="🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier League", value="premier_league"),
     app_commands.Choice(name="🇪🇸 La Liga",        value="la_liga"),
@@ -674,14 +690,25 @@ _OUTCOME_EMOJI = {"Home Win": "🏠", "Draw": "🟡", "Away Win": "✈️"}
     app_commands.Choice(name="🇫🇷 Ligue 1",         value="ligue_1"),
     app_commands.Choice(name="🇨🇴 Liga BetPlay",    value="liga_betplay"),
 ])
-async def cmd_predict(interaction: discord.Interaction, league: str = "premier_league"):
+@app_commands.choices(model=[
+    app_commands.Choice(name="Auto (ML if trained)", value="auto"),
+    app_commands.Choice(name="ML model",             value="ml"),
+    app_commands.Choice(name="Poisson baseline",     value="poisson"),
+])
+async def cmd_predict(
+    interaction: discord.Interaction,
+    league: str = "premier_league",
+    model: str = "auto",
+):
     await interaction.response.defer()
     loop = asyncio.get_event_loop()
 
-    result = await loop.run_in_executor(None, get_predictions, league)
+    result = await loop.run_in_executor(None, lambda: get_predictions(league, model=model))
     league_info  = result.get("league") or LEAGUES.get(league, {})
     predictions  = result.get("predictions", [])
     fetch_error  = result.get("error")
+    model_type   = result.get("model_type", "poisson")
+    model_meta   = result.get("model_meta") or {}
 
     if not predictions:
         await interaction.followup.send(
@@ -693,26 +720,33 @@ async def cmd_predict(interaction: discord.Interaction, league: str = "premier_l
         )
         return
 
+    trained_on = model_meta.get("total_matches") or model_meta.get("train_matches")
+    model_label = str(model_type).replace("_", " ").title()
+    model_line = f"Model: {model_label}"
+    if trained_on:
+        model_line += f" · trained on {trained_on:,} matches"
+
     embed = discord.Embed(
-        title=f"{league_info.get('flag','')} {league_info.get('name','League')} — Predicted Scores",
+        title=f"{league_info.get('flag','')} {league_info.get('name','League')} Predictions",
         colour=0xa78bfa,
-        description="Poisson model · team form from last 8 matches",
+        description=model_line,
     )
 
     for p in predictions[:8]:
         oe = _OUTCOME_EMOJI.get(p["outcome"], "")
-        bar = f"🏠 `{p['p_home']:>4.0f}%`  🟡 `{p['p_draw']:>4.0f}%`  ✈️ `{p['p_away']:>4.0f}%`"
+        date = _pretty_match_date(p.get("date"))
+        confidence = f"{p['confidence']:.0f}" if isinstance(p.get("confidence"), float) else p["confidence"]
         embed.add_field(
-            name=f"📅 {p['date']}  ·  {p['home']} vs {p['away']}",
+            name=f"{date} · {p['home']} vs {p['away']}",
             value=(
-                f"**{p['scoreline']}** — {oe} {p['outcome']} ({p['confidence']}%)\n"
-                f"{bar}\n"
-                f"xG: `{p['xg_home']}` — `{p['xg_away']}`"
+                f"Projected score **{p.get('scoreline', '—')}**  ·  {oe} **{p['outcome']}**  ·  {confidence}%\n"
+                f"Home {p['p_home']:.0f}%  ·  Draw {p['p_draw']:.0f}%  ·  Away {p['p_away']:.0f}%\n"
+                f"xG {p['xg_home']} - {p['xg_away']}"
             ),
             inline=False,
         )
 
-    embed.set_footer(text="Predictions are probabilistic estimates, not guarantees · Data: FotMob")
+    embed.set_footer(text="Probabilistic estimates, not guarantees · Data: FotMob")
     await interaction.followup.send(embed=embed)
 
 
@@ -732,7 +766,7 @@ async def cmd_help(interaction: discord.Interaction):
         ("🏟️  /match `<name>` `[number]`",          "Lineup + key events for a specific match (default: latest)"),
         ("📋  /career `<name>`",                    "Club-by-club career with totals"),
         ("⚔️  /compare `<player1>` `<player2>`",   "Head-to-head with 🥇/🥈 per category"),
-        ("⚡  /predict `<league>`",                 "Predicted scores for upcoming matches (Poisson model)"),
+        ("⚡  /predict `<league>` `[model]`",       "Predicted scores/outcomes (ML when trained, Poisson fallback)"),
     ]
     for name, desc in cmds:
         embed.add_field(name=name, value=desc, inline=False)

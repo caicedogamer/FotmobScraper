@@ -1,0 +1,1 @@
+"""FotMob scraper application package."""

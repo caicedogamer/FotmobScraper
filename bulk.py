@@ -31,8 +31,8 @@ from typing import Optional
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from db import upsert_player
-from scraper import fetch_player_json, make_session, parse_player, search_players
+from fotmob.db import init_db, upsert_player
+from fotmob.scraper import fetch_player_json, make_session, parse_player, search_players
 
 
 # ──────────────────────────────────────────────
@@ -56,7 +56,7 @@ class ScrapeResult:
 # Worker
 # ──────────────────────────────────────────────
 
-def _scrape_one(name: str, delay: float) -> ScrapeResult:
+def _scrape_one(name: str, delay: float, engine: str = "requests") -> ScrapeResult:
     """Search → fetch → parse → upsert for a single player name."""
     time.sleep(delay)   # stagger workers to avoid burst requests
     try:
@@ -67,7 +67,7 @@ def _scrape_one(name: str, delay: float) -> ScrapeResult:
         # Take the top result
         top = hits[0]
         session = make_session()
-        raw = fetch_player_json(session, top["id"], top["slug"])
+        raw = fetch_player_json(session, top["id"], top["slug"], engine=engine)
         player = parse_player(raw)
         upsert_player(player)
         return ScrapeResult(name=name, status="ok", player=player)
@@ -84,6 +84,7 @@ def bulk_scrape(
     workers: int = 3,
     delay: float = 1.0,
     progress_cb=None,
+    engine: str = "requests",
 ) -> list[ScrapeResult]:
     """
     Scrape a list of player names concurrently.
@@ -93,6 +94,7 @@ def bulk_scrape(
         workers:     Thread pool size (keep <= 3 to be polite to FotMob).
         delay:       Seconds each worker sleeps before its first request.
         progress_cb: Optional callable(result) called as each player finishes.
+        engine:      Fetch backend: "requests" (default), "scrapling", or "auto".
 
     Returns:
         List of ScrapeResult in completion order.
@@ -101,7 +103,7 @@ def bulk_scrape(
     # Stagger workers: worker i sleeps i * delay so they don't all hit at once
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(_scrape_one, name, i * delay): name
+            pool.submit(_scrape_one, name, i * delay, engine): name
             for i, name in enumerate(names)
         }
         for future in as_completed(futures):
@@ -143,7 +145,14 @@ def main():
                         help="Parallel workers (default: 3)")
     parser.add_argument("--delay",   type=float, default=1.0,
                         help="Seconds between each worker's first request (default: 1.0)")
+    parser.add_argument(
+        "--engine", default="requests",
+        choices=["requests", "scrapling", "auto"],
+        help="Fetch backend: requests (default), scrapling, or auto (requests with Scrapling fallback)",
+    )
     args = parser.parse_args()
+
+    init_db()
 
     names = list(args.names)
     if args.file:
@@ -156,7 +165,7 @@ def main():
           f"and {args.delay}s delay...\n")
 
     results = bulk_scrape(names, workers=args.workers, delay=args.delay,
-                          progress_cb=_print_result)
+                          progress_cb=_print_result, engine=args.engine)
 
     ok      = sum(1 for r in results if r.status == "ok")
     failed  = len(results) - ok
