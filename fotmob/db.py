@@ -21,7 +21,7 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parent / ".env")
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 @contextmanager
@@ -428,5 +428,4 @@ def list_imported_matches(limit: int = 100) -> list[dict]:
                 LIMIT %s
             """, (limit,))
             return [dict(r) for r in cur.fetchall()]
-
 

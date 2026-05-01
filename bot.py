@@ -35,6 +35,17 @@ from fotmob.scraper import (
 )
 from fotmob.pitch import draw_lineup_image
 from fotmob.predictor import get_predictions, LEAGUES
+from fotmob.game.cards import RARITY_COLORS, RARITY_LABELS
+from fotmob.game.db import init_game_db
+from fotmob.game.economy import claim_daily, get_balance
+from fotmob.game.inventory import (
+    collection_summary,
+    leaderboard as game_leaderboard,
+    list_inventory as game_list_inventory,
+    quick_sell as game_quick_sell,
+)
+from fotmob.game.odds import PACK_DEFINITIONS, format_odds
+from fotmob.game.packs import list_pack_types, open_pack
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -42,6 +53,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 init_db()
+init_game_db()
 
 FOTMOB_BASE = "https://www.fotmob.com"
 
@@ -750,6 +762,212 @@ async def cmd_predict(
     await interaction.followup.send(embed=embed)
 
 
+# ── Card pack minigame ────────────────────────────────────────────────────────
+
+def _user_id(interaction: discord.Interaction) -> str:
+    return str(interaction.user.id)
+
+
+def _fmt_coins(amount: int) -> str:
+    return f"{int(amount):,} coins"
+
+
+def _rarity_name(rarity: str) -> str:
+    return RARITY_LABELS.get(rarity, rarity.title())
+
+
+@tree.command(name="start_club", description="Create your card club and get starter coins")
+async def cmd_start_club(interaction: discord.Interaction):
+    balance = await asyncio.get_event_loop().run_in_executor(None, get_balance, _user_id(interaction))
+    embed = discord.Embed(
+        title="Club Created",
+        description=f"Welcome, **{interaction.user.display_name}**.\nBalance: **{_fmt_coins(balance)}**",
+        colour=C_GOLD,
+    )
+    embed.set_footer(text="Open packs, collect cards, and build your club.")
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="balance", description="Show your card club coin balance")
+async def cmd_game_balance(interaction: discord.Interaction):
+    balance = await asyncio.get_event_loop().run_in_executor(None, get_balance, _user_id(interaction))
+    await interaction.response.send_message(f"Balance: **{_fmt_coins(balance)}**", ephemeral=True)
+
+
+@tree.command(name="daily", description="Claim your daily card club coins")
+async def cmd_daily(interaction: discord.Interaction):
+    result = await asyncio.get_event_loop().run_in_executor(None, claim_daily, _user_id(interaction))
+    if result["claimed"]:
+        await interaction.response.send_message(
+            f"Claimed **{_fmt_coins(result['amount'])}**. Balance: **{_fmt_coins(result['balance'])}**",
+            ephemeral=True,
+        )
+        return
+
+    hours = result["remaining_seconds"] // 3600
+    minutes = (result["remaining_seconds"] % 3600) // 60
+    await interaction.response.send_message(
+        f"Daily already claimed. Try again in **{hours}h {minutes}m**.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="packs", description="Show available football card packs")
+async def cmd_packs(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="Available Packs",
+        colour=C_GOLD,
+        description="Odds are per pack. No real-money purchases.",
+    )
+    for pack in list_pack_types():
+        guarantee = f" · guarantees {_rarity_name(pack['guaranteed_rarity'])}+" if pack.get("guaranteed_rarity") else ""
+        embed.add_field(
+            name=f"{pack['name']} (`{pack['key']}`)",
+            value=(
+                f"Price: **{_fmt_coins(pack['price'])}** · Cards: **{pack['cards_per_pack']}**{guarantee}\n"
+                f"{pack['description']}"
+            ),
+            inline=False,
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="odds", description="Show pack rarity odds")
+@app_commands.describe(pack="Pack key, e.g. premium_pack")
+@app_commands.choices(pack=[
+    app_commands.Choice(name=pack["name"], value=key)
+    for key, pack in PACK_DEFINITIONS.items()
+])
+async def cmd_odds(interaction: discord.Interaction, pack: str):
+    info = PACK_DEFINITIONS[pack]
+    embed = discord.Embed(
+        title=f"{info['name']} Odds",
+        description=format_odds(pack),
+        colour=C_GOLD,
+    )
+    embed.set_footer(text="Odds are per card unless a pack guarantee is listed.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="pack_open", description="Open a football card pack")
+@app_commands.describe(pack="Pack to open")
+@app_commands.choices(pack=[
+    app_commands.Choice(name=pack["name"], value=key)
+    for key, pack in PACK_DEFINITIONS.items()
+])
+async def cmd_pack_open(interaction: discord.Interaction, pack: str):
+    await interaction.response.defer()
+    result = await asyncio.get_event_loop().run_in_executor(None, open_pack, _user_id(interaction), pack)
+    if not result["ok"]:
+        await interaction.followup.send(result["error"], ephemeral=True)
+        return
+
+    best = result["best"]
+    embed = discord.Embed(
+        title=f"{result['pack']['name']} Opened",
+        description=(
+            f"Best pull: **{best['rating']} {best['name']}**\n"
+            f"{_rarity_name(best['rarity'])} · {best['position']} · {best['club']}"
+        ),
+        colour=RARITY_COLORS.get(best["rarity"], C_DEFAULT),
+    )
+    lines = []
+    for card in sorted(result["cards"], key=lambda c: (c["rating"], c["name"]), reverse=True):
+        dup = f" · duplicate (+{card['coins_refunded']:,})" if card["is_duplicate"] else ""
+        lines.append(
+            f"**{card['rating']}** {card['name']} · {_rarity_name(card['rarity'])} · {card['position']}{dup}"
+        )
+    embed.add_field(name="Cards", value="\n".join(lines), inline=False)
+    embed.add_field(name="Duplicates", value=str(result["duplicates"]), inline=True)
+    embed.add_field(name="Refunded", value=_fmt_coins(result["coins_refunded"]), inline=True)
+    embed.add_field(name="Balance", value=_fmt_coins(result["balance"]), inline=True)
+    if best.get("image_url"):
+        embed.set_thumbnail(url=best["image_url"])
+    embed.set_footer(text="Odds are per pack. No real-money purchases.")
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="inventory", description="Show your football card inventory")
+@app_commands.describe(rarity="Optional rarity filter", position="Optional position filter")
+@app_commands.choices(rarity=[
+    app_commands.Choice(name=name, value=value)
+    for value, name in RARITY_LABELS.items()
+])
+async def cmd_inventory(
+    interaction: discord.Interaction,
+    rarity: str | None = None,
+    position: str | None = None,
+):
+    items = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: game_list_inventory(_user_id(interaction), rarity=rarity, position=position)
+    )
+    embed = discord.Embed(title="Your Club Inventory", colour=C_GOLD)
+    if not items:
+        embed.description = "No cards found. Open a pack to start building your club."
+    else:
+        lines = []
+        for item in items:
+            dup = f" +{item['duplicate_count']} dupes" if item["duplicate_count"] else ""
+            lines.append(
+                f"`#{item['inventory_id']}` **{item['rating']}** {item['name']} · "
+                f"{_rarity_name(item['rarity'])} · {item['position']} · {item['club']}{dup}"
+            )
+        embed.description = "\n".join(lines[:20])
+        embed.set_footer(text="Use /quick_sell inventory_id to sell a duplicate or unlocked card.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="collection", description="Show your card collection progress")
+async def cmd_collection(interaction: discord.Interaction):
+    summary = await asyncio.get_event_loop().run_in_executor(None, collection_summary, _user_id(interaction))
+    embed = discord.Embed(
+        title="Collection Progress",
+        description=f"Owned **{summary['owned']} / {summary['total']}** cards ({summary['pct']}%).",
+        colour=C_GOLD,
+    )
+    for row in summary["rarities"]:
+        embed.add_field(
+            name=_rarity_name(row["rarity"]),
+            value=f"{row['owned']} / {row['total']} ({row['pct']}%)",
+            inline=True,
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="quick_sell", description="Sell a duplicate or unlocked card for coins")
+@app_commands.describe(inventory_id="Inventory item id shown by /inventory")
+async def cmd_quick_sell(interaction: discord.Interaction, inventory_id: int):
+    result = await asyncio.get_event_loop().run_in_executor(
+        None, game_quick_sell, _user_id(interaction), inventory_id
+    )
+    if not result["ok"]:
+        await interaction.response.send_message(result["error"], ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"Sold {result['sold_copy']} **{result['rating']} {result['name']}** "
+        f"for **{_fmt_coins(result['refund'])}**. Balance: **{_fmt_coins(result['balance'])}**",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="club_leaderboard", description="Show the top card collections")
+async def cmd_club_leaderboard(interaction: discord.Interaction):
+    rows = await asyncio.get_event_loop().run_in_executor(None, game_leaderboard)
+    embed = discord.Embed(title="Club Leaderboard", colour=C_GOLD)
+    if not rows:
+        embed.description = "No clubs yet."
+    else:
+        lines = []
+        for idx, row in enumerate(rows, 1):
+            user_label = f"<@{row['discord_id']}>"
+            lines.append(
+                f"**{idx}.** {user_label} · value {int(row['collection_value']):,} · "
+                f"{int(row['unique_cards'])} cards · {_fmt_coins(row['coins'])}"
+            )
+        embed.description = "\n".join(lines)
+    await interaction.response.send_message(embed=embed)
+
+
 # ── /fotmob_help ──────────────────────────────────────────────────────────────
 
 @tree.command(name="fotmob_help", description="List all FotMob bot commands")
@@ -767,6 +985,9 @@ async def cmd_help(interaction: discord.Interaction):
         ("📋  /career `<name>`",                    "Club-by-club career with totals"),
         ("⚔️  /compare `<player1>` `<player2>`",   "Head-to-head with 🥇/🥈 per category"),
         ("⚡  /predict `<league>` `[model]`",       "Predicted scores/outcomes (ML when trained, Poisson fallback)"),
+        ("🎁  /pack_open `<pack>`",                "Open original football card packs"),
+        ("🗃️  /inventory `[rarity]` `[position]`", "View your card club"),
+        ("💰  /daily  ·  /balance",                "Claim coins and check balance"),
     ]
     for name, desc in cmds:
         embed.add_field(name=name, value=desc, inline=False)

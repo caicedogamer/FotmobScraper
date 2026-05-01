@@ -118,3 +118,72 @@ CREATE INDEX IF NOT EXISTS idx_imp_match_players_match
     ON imported_match_players(imported_match_id);
 CREATE INDEX IF NOT EXISTS idx_imp_match_events_match
     ON imported_match_events(imported_match_id);
+
+CREATE TABLE IF NOT EXISTS game_users (
+    discord_id    TEXT PRIMARY KEY,
+    coins         INTEGER NOT NULL DEFAULT 2500,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_daily_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS game_player_cards (
+    id               SERIAL PRIMARY KEY,
+    player_source_id INTEGER,
+    name             TEXT NOT NULL,
+    club             TEXT,
+    nationality      TEXT,
+    position         TEXT,
+    rating           INTEGER NOT NULL,
+    rarity           TEXT NOT NULL,
+    image_url        TEXT,
+    card_type        TEXT NOT NULL DEFAULT 'base',
+    is_active        BOOLEAN NOT NULL DEFAULT TRUE,
+    rating_formula_version TEXT,
+    rating_score     NUMERIC,
+    rating_updated_at TIMESTAMPTZ,
+    UNIQUE (name, club, card_type)
+);
+
+CREATE TABLE IF NOT EXISTS game_inventory (
+    id              SERIAL PRIMARY KEY,
+    discord_id      TEXT NOT NULL REFERENCES game_users(discord_id) ON DELETE CASCADE,
+    card_id         INTEGER NOT NULL REFERENCES game_player_cards(id) ON DELETE CASCADE,
+    duplicate_count INTEGER NOT NULL DEFAULT 0,
+    locked          BOOLEAN NOT NULL DEFAULT FALSE,
+    acquired_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (discord_id, card_id)
+);
+
+CREATE TABLE IF NOT EXISTS game_pack_types (
+    id                SERIAL PRIMARY KEY,
+    key               TEXT NOT NULL UNIQUE,
+    name              TEXT NOT NULL,
+    price             INTEGER NOT NULL,
+    cards_per_pack    INTEGER NOT NULL,
+    min_rating        INTEGER NOT NULL,
+    guaranteed_rarity TEXT,
+    description       TEXT
+);
+
+CREATE TABLE IF NOT EXISTS game_pack_openings (
+    id         SERIAL PRIMARY KEY,
+    discord_id TEXT NOT NULL REFERENCES game_users(discord_id) ON DELETE CASCADE,
+    pack_key   TEXT NOT NULL,
+    cost       INTEGER NOT NULL,
+    opened_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS game_pack_opening_items (
+    id             SERIAL PRIMARY KEY,
+    opening_id     INTEGER NOT NULL REFERENCES game_pack_openings(id) ON DELETE CASCADE,
+    card_id        INTEGER NOT NULL REFERENCES game_player_cards(id) ON DELETE CASCADE,
+    is_duplicate   BOOLEAN NOT NULL DEFAULT FALSE,
+    coins_refunded INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_game_inventory_user
+    ON game_inventory(discord_id);
+CREATE INDEX IF NOT EXISTS idx_game_cards_rarity_rating
+    ON game_player_cards(rarity, rating DESC);
+CREATE INDEX IF NOT EXISTS idx_game_openings_user
+    ON game_pack_openings(discord_id, opened_at DESC);

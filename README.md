@@ -100,6 +100,36 @@ python bulk_matches.py --file matches.txt --engine auto
 
 `players.txt`: one name per line, `#` lines are ignored.
 
+To grow `players.txt` and `players_with_meta.tsv` from real FotMob squad pages:
+
+```bash
+# append players from the built-in league set
+python collect_players.py --default-leagues --append
+
+# append one league manually: key league_id slug
+python collect_players.py --league liga_portugal 61 liga-portugal --append
+```
+
+The collector fetches league tables, walks each club squad, deduplicates by FotMob player id, and writes:
+
+- `players.txt` for bulk scraping by name
+- `players_with_meta.tsv` with `id`, `name`, `team`, `position`, `country`, `league_key`, and `league`
+
+Use `--append` to preserve the current file and enrich it. Some leagues expose their table/squad data differently on FotMob; if a league prints `0 teams`, try another slug/id or add that league manually later.
+
+To split the collected player file into metric-focused reports:
+
+```bash
+python organize_player_metrics.py
+```
+
+This writes ignored local files under `data/player_metrics/`:
+
+- `players_index.tsv`
+- `league_keys.tsv`, `teams.tsv`, `countries.tsv`, `positions.tsv`, `position_groups.tsv`
+- `by_league/`, `by_team/`, `by_country/`, and `by_position_group/`
+- `summary.json`
+
 `matches.txt`: one FotMob match URL per line, `#` lines and blank lines are ignored:
 ```
 # Premier League 2024-25
@@ -279,9 +309,76 @@ To add a new provider: create `fotmob/providers/<name>.py` with a `fetch_match(u
 
 ---
 
+## Discord Pack Minigame
+
+The Discord bot also includes an original football card minigame. It is not affiliated with EA, FIFA, or EA SPORTS FC, and it does not use real-money purchases.
+
+Game modules live in:
+
+```text
+fotmob/game/
+  cards.py      — rarity rules, duplicate refunds, seed cards
+  odds.py       — pack definitions and probability helpers
+  db.py         — game table setup and seed inserts
+  packs.py      — transactional pack opening logic
+  economy.py    — balance and daily reward helpers
+  inventory.py  — inventory, collection, quick-sell, leaderboard
+```
+
+Game commands:
+
+| command | description |
+|---|---|
+| `/start_club` | create your club and starter balance |
+| `/balance` | show coin balance |
+| `/daily` | claim daily coins |
+| `/packs` | list available packs |
+| `/odds <pack>` | show pack odds |
+| `/pack_open <pack>` | open a pack |
+| `/inventory [rarity] [position]` | show owned cards |
+| `/collection` | collection progress by rarity |
+| `/quick_sell <inventory_id>` | sell a duplicate or unlocked card |
+| `/club_leaderboard` | top collections |
+
+Default pack odds are server-side and visible with `/odds`. Duplicate cards refund coins automatically. The first seed contains 60+ original football-card entries with approximate ratings, separate from the scraper tables.
+
+### Generating Cards From Scraped Players
+
+You can turn players already saved in the scraper DB into game cards:
+
+```bash
+python generate_cards.py --dry-run
+python generate_cards.py --min-minutes 300
+python generate_cards.py --limit 500 --dry-run
+```
+
+The generator reads `players`, `season_stats`, and `matches`, then creates original ratings using `fotmob/game/ratings.py`.
+
+The formula:
+
+- groups players as `GK`, `DEF`, `MID`, or `ATT`
+- extracts available FotMob stats such as minutes, rating, goals, assists, xG, xA, tackles, interceptions, clearances, saves, and clean sheets
+- converts stats to percentiles inside each position group
+- applies position-specific weights
+- maps the score to a 50-94 card rating
+- caps low-minute players so tiny samples do not become overpowered
+
+Minute caps:
+
+```text
+<300 mins  -> max 74
+<900 mins  -> max 82
+<1500 mins -> max 87
+1500+ mins -> max 94
+```
+
+Generated cards use `card_type='generated'`, preserve the FotMob `player_source_id`, and store `rating_formula_version`, `rating_score`, and `rating_updated_at` for auditing.
+
+---
+
 ## Database
 
-Seven tables. The first four cascade-delete from `players`; the last three cascade-delete from `imported_matches`.
+The app has player scrape tables, imported match tables, and `game_*` tables for the Discord minigame.
 
 **Player tables**
 ```sql
@@ -302,6 +399,16 @@ imported_match_players  — imported_match_id, side, player_id, name, shirt, sta
 imported_match_events   — imported_match_id, event_type, minute, player, team, detail
 ```
 
+**Game tables**
+```sql
+game_users              — discord_id, coins, created_at, last_daily_at
+game_player_cards       — card pool with name, club, rating, rarity, card_type
+game_inventory          — user-owned cards and duplicate counts
+game_pack_types         — seeded pack metadata
+game_pack_openings      — pack opening audit log
+game_pack_opening_items — cards generated in each opening
+```
+
 `appearances/goals/assists` in `career` are TEXT because FotMob returns things like `"123*"` for estimated figures. Cast to INT in SQL if you need aggregates.
 
 On refresh, `upsert_player()` and `upsert_imported_match()` delete and re-insert all child rows. Full replace is simpler and fast enough given the data volumes.
@@ -318,7 +425,8 @@ On refresh, `upsert_player()` and `upsert_imported_match()` delete and re-insert
 | `/match <name> [number]` | lineup image + key events |
 | `/career <name>` | club history with totals |
 | `/compare <p1> <p2>` | head-to-head |
-| `/predict <league>` | upcoming match predictions |
+| `/predict <league> [model]` | upcoming match predictions |
+| `/start_club` etc. | card pack minigame commands |
 | `/fotmob_help` | lists commands |
 
 Commands check the local DB first, fall back to a live scrape if the player isn't cached. All blocking I/O runs in a thread pool via `run_in_executor` so the event loop stays clean.
