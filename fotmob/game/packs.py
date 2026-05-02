@@ -27,20 +27,40 @@ def _eligible_rarities(target_rarity: str) -> list[str]:
     return list(reversed(RARITY_ORDER[:idx + 1]))
 
 
-def _draw_card(cur, rarity: str, min_rating: int, rng: random.Random, excluded_ids: set[int] | None = None) -> dict:
-    excluded = list(excluded_ids or [])
+def _card_identity(card: dict) -> tuple[int | None, str]:
+    source_id = card.get("player_source_id")
+    return (
+        int(source_id) if source_id is not None else None,
+        f"{str(card.get('name') or '').lower()}|{str(card.get('club') or '').lower()}",
+    )
+
+
+def _draw_card(
+    cur,
+    rarity: str,
+    min_rating: int,
+    rng: random.Random,
+    excluded_ids: set[int] | None = None,
+    excluded_source_ids: set[int] | None = None,
+    excluded_name_clubs: set[str] | None = None,
+) -> dict:
+    excluded_cards = list(excluded_ids or [])
+    excluded_sources = list(excluded_source_ids or [])
+    excluded_names = list(excluded_name_clubs or [])
     for candidate in _eligible_rarities(rarity):
-        if excluded:
+        if excluded_cards or excluded_sources or excluded_names:
             cur.execute("""
                 SELECT *
                 FROM game_player_cards
                 WHERE is_active
                   AND rarity = %s
                   AND rating >= %s
-                  AND NOT (id = ANY(%s))
+                  AND NOT (id = ANY(%s::int[]))
+                  AND (player_source_id IS NULL OR NOT (player_source_id = ANY(%s::int[])))
+                  AND NOT (LOWER(name) || '|' || LOWER(COALESCE(club, '')) = ANY(%s::text[]))
                 ORDER BY RANDOM()
                 LIMIT 1
-            """, (candidate, min_rating, excluded))
+            """, (candidate, min_rating, excluded_cards, excluded_sources, excluded_names))
         else:
             cur.execute("""
                 SELECT *
@@ -52,12 +72,14 @@ def _draw_card(cur, rarity: str, min_rating: int, rng: random.Random, excluded_i
         row = cur.fetchone()
         if row:
             return dict(row)
-    if excluded:
+    if excluded_cards or excluded_sources or excluded_names:
         cur.execute("""
             SELECT *
             FROM game_player_cards
             WHERE is_active
-              AND NOT (id = ANY(%s))
+              AND NOT (id = ANY(%s::int[]))
+              AND (player_source_id IS NULL OR NOT (player_source_id = ANY(%s::int[])))
+              AND NOT (LOWER(name) || '|' || LOWER(COALESCE(club, '')) = ANY(%s::text[]))
             ORDER BY
                 CASE rarity
                     WHEN 'common' THEN 0
@@ -70,7 +92,7 @@ def _draw_card(cur, rarity: str, min_rating: int, rng: random.Random, excluded_i
                 END,
                 RANDOM()
             LIMIT 1
-        """, (excluded,))
+        """, (excluded_cards, excluded_sources, excluded_names))
     else:
         cur.execute("""
             SELECT *
@@ -90,7 +112,7 @@ def _draw_card(cur, rarity: str, min_rating: int, rng: random.Random, excluded_i
             LIMIT 1
         """)
     row = cur.fetchone()
-    if not row and excluded:
+    if not row and (excluded_cards or excluded_sources or excluded_names):
         cur.execute("""
             SELECT *
             FROM game_player_cards
@@ -185,10 +207,24 @@ def open_pack(discord_id: str, pack_key: str) -> dict:
 
             pulled = []
             pulled_card_ids = set()
+            pulled_source_ids = set()
+            pulled_name_clubs = set()
             total_refund = 0
             for rarity in target_rarities:
-                card = _draw_card(cur, rarity, pack["min_rating"], rng, pulled_card_ids)
+                card = _draw_card(
+                    cur,
+                    rarity,
+                    pack["min_rating"],
+                    rng,
+                    pulled_card_ids,
+                    pulled_source_ids,
+                    pulled_name_clubs,
+                )
                 pulled_card_ids.add(card["id"])
+                source_id, name_club = _card_identity(card)
+                if source_id is not None:
+                    pulled_source_ids.add(source_id)
+                pulled_name_clubs.add(name_club)
                 is_duplicate, refund = _add_to_inventory(cur, discord_id, card)
                 total_refund += refund
                 cur.execute("""

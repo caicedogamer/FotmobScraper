@@ -3,7 +3,7 @@
 import psycopg2.extras
 
 from fotmob.db import get_conn
-from fotmob.game.cards import seed_card_dicts
+from fotmob.game.cards import metadata_card_dicts, seed_card_dicts
 from fotmob.game.odds import PACK_DEFINITIONS
 
 
@@ -112,7 +112,12 @@ def init_game_db():
             from fotmob.game.squad import init_squad_tables
             init_squad_tables(cur)
 
-            cards = seed_card_dicts()
+            cards = seed_card_dicts(include_metadata=False)
+            metadata_cards = metadata_card_dicts()
+            cur.execute("SELECT COUNT(*) FROM game_player_cards WHERE card_type = 'metadata'")
+            metadata_count = int(cur.fetchone()[0])
+            if metadata_count < len(metadata_cards):
+                cards.extend(metadata_cards)
             psycopg2.extras.execute_values(cur, """
                 INSERT INTO game_player_cards
                     (player_source_id, name, club, nationality, position, rating, rarity, image_url, card_type)

@@ -18,6 +18,7 @@ Setup:
 
 import asyncio
 import io
+import logging
 import os
 import sys
 from pathlib import Path
@@ -53,6 +54,7 @@ from fotmob.game.squad import (
 from fotmob.squad_pitch import draw_squad_image
 
 load_dotenv(Path(__file__).parent / ".env")
+logger = logging.getLogger(__name__)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")

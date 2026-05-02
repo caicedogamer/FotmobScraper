@@ -173,7 +173,7 @@ def metadata_card_dicts(limit: int | None = None) -> list[dict]:
     return cards
 
 
-def seed_card_dicts() -> list[dict]:
+def seed_card_dicts(include_metadata: bool = True) -> list[dict]:
     cards = []
     for name, club, nationality, position, rating in SEED_PLAYERS:
         cards.append({
@@ -187,5 +187,6 @@ def seed_card_dicts() -> list[dict]:
             "card_type": "base",
             "image_url": None,
         })
-    cards.extend(metadata_card_dicts())
+    if include_metadata:
+        cards.extend(metadata_card_dicts())
     return cards

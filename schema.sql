@@ -154,6 +154,20 @@ CREATE TABLE IF NOT EXISTS game_inventory (
     UNIQUE (discord_id, card_id)
 );
 
+CREATE TABLE IF NOT EXISTS game_squads (
+    discord_id  TEXT PRIMARY KEY REFERENCES game_users(discord_id) ON DELETE CASCADE,
+    formation   TEXT NOT NULL DEFAULT '4-3-3',
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS game_squad_slots (
+    id           SERIAL PRIMARY KEY,
+    discord_id   TEXT NOT NULL REFERENCES game_squads(discord_id) ON DELETE CASCADE,
+    slot_key     TEXT NOT NULL,
+    inventory_id INTEGER REFERENCES game_inventory(id) ON DELETE SET NULL,
+    UNIQUE (discord_id, slot_key)
+);
+
 CREATE TABLE IF NOT EXISTS game_pack_types (
     id                SERIAL PRIMARY KEY,
     key               TEXT NOT NULL UNIQUE,
@@ -183,6 +197,8 @@ CREATE TABLE IF NOT EXISTS game_pack_opening_items (
 
 CREATE INDEX IF NOT EXISTS idx_game_inventory_user
     ON game_inventory(discord_id);
+CREATE INDEX IF NOT EXISTS idx_squad_slots_user
+    ON game_squad_slots(discord_id);
 CREATE INDEX IF NOT EXISTS idx_game_cards_rarity_rating
     ON game_player_cards(rarity, rating DESC);
 CREATE INDEX IF NOT EXISTS idx_game_openings_user
