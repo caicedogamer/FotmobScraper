@@ -37,7 +37,7 @@ from fotmob.pitch import draw_lineup_image
 from fotmob.predictor import get_predictions, LEAGUES
 from fotmob.game.cards import RARITY_COLORS, RARITY_LABELS
 from fotmob.game.db import init_game_db
-from fotmob.game.economy import claim_daily, get_balance
+from fotmob.game.economy import add_currency, claim_daily, get_balance
 from fotmob.game.inventory import (
     collection_summary,
     leaderboard as game_leaderboard,
@@ -46,6 +46,11 @@ from fotmob.game.inventory import (
 )
 from fotmob.game.odds import PACK_DEFINITIONS, format_odds
 from fotmob.game.packs import list_pack_types, open_pack
+from fotmob.game.squad import (
+    FORMATIONS, VALID_FORMATIONS, DEFAULT_FORMATION,
+    get_squad, set_formation, place_player, remove_player, clear_squad,
+)
+from fotmob.squad_pitch import draw_squad_image
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -772,6 +777,23 @@ def _fmt_coins(amount: int) -> str:
     return f"{int(amount):,} coins"
 
 
+def _owner_ids_from_env() -> set[int]:
+    raw = os.getenv("DISCORD_OWNER_ID") or os.getenv("DISCORD_OWNER_IDS") or ""
+    owner_ids = set()
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if part.isdigit():
+            owner_ids.add(int(part))
+    return owner_ids
+
+
+async def _can_manage_currency(interaction: discord.Interaction) -> bool:
+    if interaction.user.id in _owner_ids_from_env():
+        return True
+    return await bot.is_owner(interaction.user)
+
+
+
 def _rarity_name(rarity: str) -> str:
     return RARITY_LABELS.get(rarity, rarity.title())
 
@@ -792,6 +814,39 @@ async def cmd_start_club(interaction: discord.Interaction):
 async def cmd_game_balance(interaction: discord.Interaction):
     balance = await asyncio.get_event_loop().run_in_executor(None, get_balance, _user_id(interaction))
     await interaction.response.send_message(f"Balance: **{_fmt_coins(balance)}**", ephemeral=True)
+
+
+@tree.command(name="add-currency", description="Add test coins for opening packs")
+@app_commands.describe(
+    amount="Coins to add",
+    user="Optional user to receive the coins; defaults to you",
+)
+async def cmd_add_currency(
+    interaction: discord.Interaction,
+    amount: app_commands.Range[int, 1, 1_000_000],
+    user: discord.User | None = None,
+):
+    if not await _can_manage_currency(interaction):
+        await interaction.response.send_message(
+            "Only the bot owner can add test coins.",
+            ephemeral=True,
+        )
+        return
+
+    target = user or interaction.user
+    result = await asyncio.get_event_loop().run_in_executor(
+        None,
+        add_currency,
+        str(target.id),
+        int(amount),
+    )
+    await interaction.response.send_message(
+        (
+            f"Added **{_fmt_coins(result['amount'])}** to **{target.display_name}**.\n"
+            f"New balance: **{_fmt_coins(result['balance'])}**"
+        ),
+        ephemeral=True,
+    )
 
 
 @tree.command(name="daily", description="Claim your daily card club coins")
@@ -968,6 +1023,132 @@ async def cmd_club_leaderboard(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+# ── Squad commands ────────────────────────────────────────────────────────────
+
+@tree.command(name="squad_view", description="View your squad formation sheet")
+async def cmd_squad_view(interaction: discord.Interaction):
+    await interaction.response.defer()
+    loop = asyncio.get_event_loop()
+    try:
+        squad_data = await loop.run_in_executor(None, get_squad, _user_id(interaction))
+        formation  = squad_data["formation"]
+        slot_defs  = FORMATIONS[formation]
+
+        img_bytes = await loop.run_in_executor(
+            None,
+            lambda: draw_squad_image(
+                formation=formation,
+                slots=squad_data["slots"],
+                slot_defs=slot_defs,
+                user_name=f"{interaction.user.display_name}'s Club",
+            ),
+        )
+        file  = discord.File(io.BytesIO(img_bytes), filename="squad.png")
+        filled = sum(1 for v in squad_data["slots"].values() if v is not None)
+        embed = discord.Embed(
+            title=f"⚽  {interaction.user.display_name}'s Squad",
+            description=(
+                f"Formation: **{formation}**  ·  **{filled}/11** positions filled\n"
+                f"Use `/squad_place` to add cards  ·  `/squad_set` to change formation"
+            ),
+            colour=C_GOLD,
+        )
+        embed.set_image(url="attachment://squad.png")
+        embed.set_footer(text="Slot keys: use /squad_set to see all positions for your formation")
+        await interaction.followup.send(embed=embed, file=file)
+    except Exception as exc:
+        logger.exception("squad_view failed for user %s", _user_id(interaction))
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="Rendering failed",
+                description=f"```{exc}```",
+                colour=C_LOSS,
+            ),
+            ephemeral=True,
+        )
+
+
+@tree.command(name="squad_set", description="Choose your squad formation")
+@app_commands.describe(formation="Formation (4-3-3, 4-2-3-1, 4-4-2, 3-5-2)")
+@app_commands.choices(formation=[
+    app_commands.Choice(name="4-3-3  (classic)",  value="4-3-3"),
+    app_commands.Choice(name="4-2-3-1",            value="4-2-3-1"),
+    app_commands.Choice(name="4-4-2  (flat)",      value="4-4-2"),
+    app_commands.Choice(name="3-5-2",              value="3-5-2"),
+])
+async def cmd_squad_set(interaction: discord.Interaction, formation: str):
+    result = await asyncio.get_event_loop().run_in_executor(
+        None, set_formation, _user_id(interaction), formation
+    )
+    if not result["ok"]:
+        await interaction.response.send_message(result["error"], ephemeral=True)
+        return
+
+    slot_defs  = FORMATIONS[formation]
+    slots_list = "  ·  ".join(s["key"] for s in slot_defs)
+    embed = discord.Embed(
+        title=f"Formation set: {formation}",
+        description=(
+            f"**Slots:** {slots_list}\n\n"
+            f"Use `/squad_place position:<slot> inventory_id:<id>` to add players.\n"
+            f"Use `/inventory` to see your cards and their IDs."
+        ),
+        colour=C_GOLD,
+    )
+    embed.set_footer(text="Slots not in the new formation have been cleared.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="squad_place", description="Place a card from your inventory into a squad slot")
+@app_commands.describe(
+    position="Slot key (e.g. GK, LB, ST) — run /squad_view to see all slots",
+    inventory_id="Card inventory ID shown by /inventory",
+)
+async def cmd_squad_place(
+    interaction: discord.Interaction,
+    position: str,
+    inventory_id: int,
+):
+    result = await asyncio.get_event_loop().run_in_executor(
+        None, place_player, _user_id(interaction), position, inventory_id
+    )
+    if not result["ok"]:
+        await interaction.response.send_message(result["error"], ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"Placed **{result['rating']} {result['name']}** "
+        f"({_rarity_name(result['rarity'])}) in slot **{result['slot']}**.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="squad_remove", description="Remove a card from a squad slot")
+@app_commands.describe(position="Slot key to clear (e.g. GK, ST)")
+async def cmd_squad_remove(interaction: discord.Interaction, position: str):
+    result = await asyncio.get_event_loop().run_in_executor(
+        None, remove_player, _user_id(interaction), position
+    )
+    if result["removed"]:
+        await interaction.response.send_message(
+            f"Slot **{result['slot']}** cleared.", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"Slot **{result['slot']}** was already empty.", ephemeral=True
+        )
+
+
+@tree.command(name="squad_clear", description="Remove all players from your squad")
+async def cmd_squad_clear(interaction: discord.Interaction):
+    await asyncio.get_event_loop().run_in_executor(
+        None, clear_squad, _user_id(interaction)
+    )
+    await interaction.response.send_message(
+        "Squad cleared. Formation is kept — use `/squad_place` to rebuild it.",
+        ephemeral=True,
+    )
+
+
 # ── /fotmob_help ──────────────────────────────────────────────────────────────
 
 @tree.command(name="fotmob_help", description="List all FotMob bot commands")
@@ -984,10 +1165,15 @@ async def cmd_help(interaction: discord.Interaction):
         ("🏟️  /match `<name>` `[number]`",          "Lineup + key events for a specific match (default: latest)"),
         ("📋  /career `<name>`",                    "Club-by-club career with totals"),
         ("⚔️  /compare `<player1>` `<player2>`",   "Head-to-head with 🥇/🥈 per category"),
-        ("⚡  /predict `<league>` `[model]`",       "Predicted scores/outcomes (ML when trained, Poisson fallback)"),
-        ("🎁  /pack_open `<pack>`",                "Open original football card packs"),
-        ("🗃️  /inventory `[rarity]` `[position]`", "View your card club"),
-        ("💰  /daily  ·  /balance",                "Claim coins and check balance"),
+        ("⚡  /predict `<league>` `[model]`",            "Predicted scores/outcomes (ML when trained, Poisson fallback)"),
+        ("🎁  /pack_open `<pack>`",                   "Open football card packs"),
+        ("🗃️  /inventory `[rarity]` `[position]`",   "View your card inventory with IDs"),
+        ("💰  /daily  ·  /balance",                   "Claim coins and check balance"),
+        ("⚽  /squad_view",                            "Render your squad formation sheet"),
+        ("🔧  /squad_set `<formation>`",               "Set formation (4-3-3, 4-2-3-1, 4-4-2, 3-5-2)"),
+        ("➕  /squad_place `<position>` `<inv_id>`",  "Place a card from /inventory into a slot"),
+        ("➖  /squad_remove `<position>`",             "Clear one slot"),
+        ("🗑️  /squad_clear",                          "Reset all squad slots"),
     ]
     for name, desc in cmds:
         embed.add_field(name=name, value=desc, inline=False)

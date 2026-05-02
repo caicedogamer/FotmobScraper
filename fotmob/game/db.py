@@ -108,12 +108,17 @@ def init_game_db():
                     pack["min_rating"], pack["guaranteed_rarity"], pack["description"],
                 ))
 
+            # Squad tables (added after base game tables so FKs resolve)
+            from fotmob.game.squad import init_squad_tables
+            init_squad_tables(cur)
+
             cards = seed_card_dicts()
             psycopg2.extras.execute_values(cur, """
                 INSERT INTO game_player_cards
-                    (name, club, nationality, position, rating, rarity, image_url, card_type)
+                    (player_source_id, name, club, nationality, position, rating, rarity, image_url, card_type)
                 VALUES %s
                 ON CONFLICT (name, club, card_type) DO UPDATE SET
+                    player_source_id = EXCLUDED.player_source_id,
                     nationality = EXCLUDED.nationality,
                     position = EXCLUDED.position,
                     rating = EXCLUDED.rating,
@@ -122,6 +127,7 @@ def init_game_db():
                     is_active = TRUE
             """, [
                 (
+                    c.get("player_source_id"),
                     c["name"], c["club"], c["nationality"], c["position"],
                     c["rating"], c["rarity"], c["image_url"], c["card_type"],
                 )

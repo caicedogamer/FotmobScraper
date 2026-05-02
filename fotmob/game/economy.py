@@ -20,6 +20,26 @@ def get_balance(discord_id: str) -> int:
             return int(cur.fetchone()["coins"])
 
 
+def add_currency(discord_id: str, amount: int) -> dict:
+    amount = int(amount)
+    if amount <= 0:
+        raise ValueError("amount must be positive")
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            ensure_user(cur, discord_id)
+            cur.execute("""
+                UPDATE game_users
+                SET coins = coins + %s
+                WHERE discord_id = %s
+                RETURNING coins
+            """, (amount, discord_id))
+            return {
+                "amount": amount,
+                "balance": int(cur.fetchone()["coins"]),
+            }
+
+
 def claim_daily(discord_id: str) -> dict:
     now = datetime.now(timezone.utc)
     with get_conn() as conn:

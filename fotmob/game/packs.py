@@ -27,26 +27,88 @@ def _eligible_rarities(target_rarity: str) -> list[str]:
     return list(reversed(RARITY_ORDER[:idx + 1]))
 
 
-def _draw_card(cur, rarity: str, min_rating: int, rng: random.Random) -> dict:
+def _draw_card(cur, rarity: str, min_rating: int, rng: random.Random, excluded_ids: set[int] | None = None) -> dict:
+    excluded = list(excluded_ids or [])
     for candidate in _eligible_rarities(rarity):
-        cur.execute("""
-            SELECT *
-            FROM game_player_cards
-            WHERE is_active AND rarity = %s AND rating >= %s
-            ORDER BY RANDOM()
-            LIMIT 1
-        """, (candidate, min_rating))
+        if excluded:
+            cur.execute("""
+                SELECT *
+                FROM game_player_cards
+                WHERE is_active
+                  AND rarity = %s
+                  AND rating >= %s
+                  AND NOT (id = ANY(%s))
+                ORDER BY RANDOM()
+                LIMIT 1
+            """, (candidate, min_rating, excluded))
+        else:
+            cur.execute("""
+                SELECT *
+                FROM game_player_cards
+                WHERE is_active AND rarity = %s AND rating >= %s
+                ORDER BY RANDOM()
+                LIMIT 1
+            """, (candidate, min_rating))
         row = cur.fetchone()
         if row:
             return dict(row)
-    cur.execute("""
-        SELECT *
-        FROM game_player_cards
-        WHERE is_active
-        ORDER BY rating ASC, RANDOM()
-        LIMIT 1
-    """)
+    if excluded:
+        cur.execute("""
+            SELECT *
+            FROM game_player_cards
+            WHERE is_active
+              AND NOT (id = ANY(%s))
+            ORDER BY
+                CASE rarity
+                    WHEN 'common' THEN 0
+                    WHEN 'uncommon' THEN 1
+                    WHEN 'rare' THEN 2
+                    WHEN 'elite' THEN 3
+                    WHEN 'legendary' THEN 4
+                    WHEN 'mythic' THEN 5
+                    ELSE 99
+                END,
+                RANDOM()
+            LIMIT 1
+        """, (excluded,))
+    else:
+        cur.execute("""
+            SELECT *
+            FROM game_player_cards
+            WHERE is_active
+            ORDER BY
+                CASE rarity
+                    WHEN 'common' THEN 0
+                    WHEN 'uncommon' THEN 1
+                    WHEN 'rare' THEN 2
+                    WHEN 'elite' THEN 3
+                    WHEN 'legendary' THEN 4
+                    WHEN 'mythic' THEN 5
+                    ELSE 99
+                END,
+                RANDOM()
+            LIMIT 1
+        """)
     row = cur.fetchone()
+    if not row and excluded:
+        cur.execute("""
+            SELECT *
+            FROM game_player_cards
+            WHERE is_active
+            ORDER BY
+                CASE rarity
+                    WHEN 'common' THEN 0
+                    WHEN 'uncommon' THEN 1
+                    WHEN 'rare' THEN 2
+                    WHEN 'elite' THEN 3
+                    WHEN 'legendary' THEN 4
+                    WHEN 'mythic' THEN 5
+                    ELSE 99
+                END,
+                RANDOM()
+            LIMIT 1
+        """)
+        row = cur.fetchone()
     if not row:
         raise ValueError("No active player cards are seeded.")
     return dict(row)
@@ -122,9 +184,11 @@ def open_pack(discord_id: str, pack_key: str) -> dict:
                 target_rarities[weakest_idx] = guarantee
 
             pulled = []
+            pulled_card_ids = set()
             total_refund = 0
             for rarity in target_rarities:
-                card = _draw_card(cur, rarity, pack["min_rating"], rng)
+                card = _draw_card(cur, rarity, pack["min_rating"], rng, pulled_card_ids)
+                pulled_card_ids.add(card["id"])
                 is_duplicate, refund = _add_to_inventory(cur, discord_id, card)
                 total_refund += refund
                 cur.execute("""

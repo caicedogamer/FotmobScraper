@@ -63,6 +63,7 @@ PG_DB=fotmob
 PG_USER=postgres
 PG_PASSWORD=yourpassword
 DISCORD_TOKEN=your_bot_token_here
+DISCORD_OWNER_ID=your_discord_user_id_here  # optional; restricts owner-only test commands to you
 ```
 
 Create the database:
@@ -323,6 +324,9 @@ fotmob/game/
   packs.py      — transactional pack opening logic
   economy.py    — balance and daily reward helpers
   inventory.py  — inventory, collection, quick-sell, leaderboard
+  squad.py      — squad formation data, DB helpers
+fotmob/
+  squad_pitch.py — squad formation image renderer
 ```
 
 Game commands:
@@ -331,6 +335,7 @@ Game commands:
 |---|---|
 | `/start_club` | create your club and starter balance |
 | `/balance` | show coin balance |
+| `/add-currency <amount> [user]` | add test coins to yourself or another user; bot owner only |
 | `/daily` | claim daily coins |
 | `/packs` | list available packs |
 | `/odds <pack>` | show pack odds |
@@ -339,6 +344,26 @@ Game commands:
 | `/collection` | collection progress by rarity |
 | `/quick_sell <inventory_id>` | sell a duplicate or unlocked card |
 | `/club_leaderboard` | top collections |
+| `/squad_view` | render your squad formation sheet as an image |
+| `/squad_set <formation>` | set formation — `4-3-3`, `4-2-3-1`, `4-4-2`, `3-5-2` |
+| `/squad_place <position> <inventory_id>` | place a card into a slot (see `/inventory` for IDs) |
+| `/squad_remove <position>` | clear one slot |
+| `/squad_clear` | reset all squad slots (formation is kept) |
+
+### Squad sheet
+
+Each user has one persistent squad. Call `/squad_set` to choose a formation — this defines the available slot keys. Call `/inventory` to find card IDs, then `/squad_place position:GK inventory_id:3` to fill a slot.
+
+`/squad_view` renders a full-pitch formation image with each filled slot showing the card rating (coloured by value), player name, and a rarity dot. Empty slots appear as grey placeholders. Cards sold via `/quick_sell` are automatically evicted from any squad slot.
+
+**Supported formations and slot keys:**
+
+| Formation | Slot keys |
+|---|---|
+| `4-3-3` | GK · LB · LCB · RCB · RB · LCM · CM · RCM · LW · ST · RW |
+| `4-2-3-1` | GK · LB · LCB · RCB · RB · LCDM · RCDM · LAM · CAM · RAM · ST |
+| `4-4-2` | GK · LB · LCB · RCB · RB · LM · LCM · RCM · RM · LST · RST |
+| `3-5-2` | GK · LCB · CB · RCB · LWB · LCM · CDM · RCM · RWB · LST · RST |
 
 Default pack odds are server-side and visible with `/odds`. Duplicate cards refund coins automatically. The first seed contains 60+ original football-card entries with approximate ratings, separate from the scraper tables.
 
@@ -407,6 +432,8 @@ game_inventory          — user-owned cards and duplicate counts
 game_pack_types         — seeded pack metadata
 game_pack_openings      — pack opening audit log
 game_pack_opening_items — cards generated in each opening
+game_squads             — discord_id, formation, updated_at
+game_squad_slots        — discord_id, slot_key, inventory_id (FK → game_inventory, ON DELETE SET NULL)
 ```
 
 `appearances/goals/assists` in `career` are TEXT because FotMob returns things like `"123*"` for estimated figures. Cast to INT in SQL if you need aggregates.
@@ -427,6 +454,8 @@ On refresh, `upsert_player()` and `upsert_imported_match()` delete and re-insert
 | `/compare <p1> <p2>` | head-to-head |
 | `/predict <league> [model]` | upcoming match predictions |
 | `/start_club` etc. | card pack minigame commands |
+| `/squad_view` | squad formation sheet |
+| `/squad_set` · `/squad_place` · `/squad_remove` · `/squad_clear` | squad management |
 | `/fotmob_help` | lists commands |
 
 Commands check the local DB first, fall back to a live scrape if the player isn't cached. All blocking I/O runs in a thread pool via `run_in_executor` so the event loop stays clean.

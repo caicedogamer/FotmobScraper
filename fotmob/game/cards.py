@@ -1,5 +1,9 @@
 """Card rarity rules and seed player data for the Discord minigame."""
 
+import csv
+import hashlib
+from pathlib import Path
+
 RARITY_ORDER = ["common", "uncommon", "rare", "elite", "legendary", "mythic"]
 
 RARITY_COLORS = {
@@ -109,10 +113,71 @@ SEED_PLAYERS = [
 ]
 
 
+LEAGUE_COMMON_BASE_RATINGS = {
+    "premier_league": 60,
+    "la_liga": 60,
+    "serie_a": 60,
+    "bundesliga": 59,
+    "ligue_1": 59,
+    "brasileirao": 57,
+    "liga_portugal": 56,
+    "super_lig": 56,
+}
+
+
+def _metadata_rating(player_id: str, league_key: str) -> int:
+    """Create a stable low-tier rating for metadata-only cards."""
+    primary_league = (league_key or "").split(",")[0]
+    base = LEAGUE_COMMON_BASE_RATINGS.get(primary_league, 55)
+    digest = hashlib.sha1(str(player_id).encode("utf-8")).hexdigest()
+    return min(64, base + int(digest[:2], 16) % 5)
+
+
+def metadata_card_dicts(limit: int | None = None) -> list[dict]:
+    """Build a broad common card pool from collected real player metadata."""
+    path = Path(__file__).resolve().parents[2] / "players_with_meta.tsv"
+    if not path.exists():
+        return []
+
+    base_names = {name.lower() for name, *_ in SEED_PLAYERS}
+    cards = []
+    seen = set()
+    with path.open("r", encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f, delimiter="\t"):
+            name = (row.get("name") or "").strip()
+            club = (row.get("team") or "").strip()
+            player_id = str(row.get("id") or "").strip()
+            if not name or not club or not player_id:
+                continue
+            if name.lower() in base_names:
+                continue
+            key = (name.lower(), club.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+
+            rating = _metadata_rating(player_id, row.get("league_key") or "")
+            cards.append({
+                "player_source_id": int(player_id) if player_id.isdigit() else None,
+                "name": name,
+                "club": club,
+                "nationality": row.get("country") or None,
+                "position": row.get("position") or None,
+                "rating": rating,
+                "rarity": rarity_for_rating(rating),
+                "card_type": "metadata",
+                "image_url": None,
+            })
+            if limit and len(cards) >= limit:
+                break
+    return cards
+
+
 def seed_card_dicts() -> list[dict]:
     cards = []
     for name, club, nationality, position, rating in SEED_PLAYERS:
         cards.append({
+            "player_source_id": None,
             "name": name,
             "club": club,
             "nationality": nationality,
@@ -122,5 +187,5 @@ def seed_card_dicts() -> list[dict]:
             "card_type": "base",
             "image_url": None,
         })
+    cards.extend(metadata_card_dicts())
     return cards
-
